@@ -4,7 +4,7 @@
  *	  routines for managing the buffer pool's replacement strategy.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,7 +15,6 @@
  */
 #include "postgres.h"
 
-#include "pgstat.h"
 #include "port/atomics.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
@@ -41,6 +40,9 @@ typedef struct
 
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
+
+	int lruQueueHead;
+	int lruQueueTail;
 
 	/*
 	 * NOTE: lastFreeBuffer is undefined when firstFreeBuffer is -1 (that is,
@@ -74,13 +76,19 @@ typedef struct BufferAccessStrategyData
 	/* Overall strategy type */
 	BufferAccessStrategyType btype;
 	/* Number of elements in buffers[] array */
-	int			nbuffers;
+	int			ring_size;
 
 	/*
 	 * Index of the "current" slot in the ring, ie, the one most recently
 	 * returned by GetBufferFromRing.
 	 */
 	int			current;
+
+	/*
+	 * True if the buffer just returned by StrategyGetBuffer had been in the
+	 * ring already.
+	 */
+	bool		current_was_in_ring;
 
 	/*
 	 * Array of buffer numbers.  InvalidBuffer (that is, zero) indicates we
@@ -180,6 +188,164 @@ have_free_buffer(void)
 		return false;
 }
 
+
+
+
+/**
+ * Added by Kodanda Ravi Kiran
+ *  RemoveFromLRU_Locked
+ * 
+ * Takes the buffer descriptor as input to be removed from the LRU Queue. 
+ * It expects to hold the lock of Buffer Header.
+ * When returning it releases the lock.
+*/
+
+void RemoveFromLRU_Locked(BufferDesc *buf){
+	uint32 local_buf_state, local_buf_state1;
+	if(buf->prevInLRU>=0){
+		BufferDesc *buf1 = GetBufferDescriptor(buf->prevInLRU);
+		local_buf_state1 = LockBufHdr(buf1);
+		buf1->nextInLRU = buf->nextInLRU;
+		UnlockBufHdr(buf1, local_buf_state1);
+		
+	}
+	if(buf->nextInLRU>=0){
+		BufferDesc *buf1 = GetBufferDescriptor(buf->nextInLRU);
+		local_buf_state1 = LockBufHdr(buf1);
+		buf1->prevInLRU = buf->prevInLRU;
+		UnlockBufHdr(buf1, local_buf_state1);
+	}
+	if(buf->prevInLRU==LRUNEXT_END_IN_LRU){
+		StrategyControl->lruQueueHead = buf->nextInLRU;
+	}
+	if(buf->nextInLRU==LRUNEXT_END_IN_LRU){
+		if(buf->prevInLRU>=0){
+			StrategyControl->lruQueueTail = buf->prevInLRU;
+		}
+		else{
+			StrategyControl->lruQueueTail = LRUNEXT_END_IN_LRU;
+		}
+		
+	}
+		elog(LOG, "Buffer %d evicted from Head of LRU Queue - LRU Repalcement Algorithm", buf->buf_id);
+	buf->prevInLRU = LRUNEXT_NOT_IN_LRU;
+	buf->nextInLRU = LRUNEXT_NOT_IN_LRU;
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
+
+/*
+RemoveFromLRU
+
+Added by Kodanda Ravi Kiran
+Function to remove the buffer from the LRU Queue. 
+Buffer at any position in the list can be removed.
+It takes the bufferId of the buffer to be removed from the LRU Queue. 
+*/
+
+
+void RemoveFromLRU(int bufId){
+	
+	uint32 local_buf_state, local_buf_state1;
+	BufferDesc *buf = GetBufferDescriptor(bufId);
+	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+	local_buf_state = LockBufHdr(buf);
+
+	if(buf->prevInLRU>=0){
+		BufferDesc *buf1 = GetBufferDescriptor(buf->prevInLRU);
+		local_buf_state1 = LockBufHdr(buf1);
+		buf1->nextInLRU = buf->nextInLRU;
+		UnlockBufHdr(buf1, local_buf_state1);
+	}
+	if(buf->nextInLRU>=0){
+		BufferDesc *buf1 = GetBufferDescriptor(buf->nextInLRU);
+		local_buf_state1 = LockBufHdr(buf1);
+		buf1->prevInLRU = buf->prevInLRU;
+		UnlockBufHdr(buf1, local_buf_state1);
+	}
+	/*
+	If the buffer is at head then update the head in StrategyControl
+	*/
+	if(buf->prevInLRU==LRUNEXT_END_IN_LRU){
+		StrategyControl->lruQueueHead = buf->nextInLRU;
+	}
+	/*
+	If the buffer is at tail then update the tail to prevInLRU of buffer
+	*/
+	if(buf->nextInLRU==LRUNEXT_END_IN_LRU){
+		if(buf->prevInLRU>=0){
+			StrategyControl->lruQueueTail = buf->prevInLRU;
+		}
+		else{
+			StrategyControl->lruQueueTail = LRUNEXT_END_IN_LRU;
+		}
+		
+	}
+	/*
+	Remove the buffer from list.
+	*/
+		elog(LOG, "Buffer %d is pinned. Removing it from LRU Queue.", buf->buf_id);
+	buf->prevInLRU = LRUNEXT_NOT_IN_LRU;
+	buf->nextInLRU = LRUNEXT_NOT_IN_LRU;
+	UnlockBufHdr(buf ,local_buf_state);
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+}
+
+/*
+AddToTail
+
+
+Added by Kodanda Ravi Kiran
+Function to add the buffer to tail of LRU Queue. 
+Function takes the bufferId of the buffer to be added to LRU Queue
+*/
+
+void AddToTail(int bufId){
+	
+	uint32 local_buf_state, local_buf_state1;
+	BufferDesc *buf, *buf1;
+	SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+	buf = GetBufferDescriptor(bufId);
+	local_buf_state = LockBufHdr(buf);
+	/*
+	if the buffer that is passed to add is already in the LRU queue, then don't add it again.
+	This situation is unlikely to occur. But As the lock is acquired inside the function, multiple process might have called the function with same buffer Id at same time. 
+	Hence this additional check is needed.
+	*/
+	if(buf->nextInLRU!=LRUNEXT_NOT_IN_LRU){
+		UnlockBufHdr(buf, local_buf_state);
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+	}
+	else{
+	elog(LOG, "Add Buffer %d to LRU Queue - Refcount reached to 0", bufId);
+	buf->prevInLRU = StrategyControl->lruQueueTail;
+	buf->nextInLRU = LRUNEXT_END_IN_LRU;
+
+	/*
+	 * If the tail is already present then add the buffer to the end of tail
+	*/
+	if(StrategyControl->lruQueueTail>=0){
+		if(StrategyControl->lruQueueTail!=bufId){
+		buf1 = GetBufferDescriptor(StrategyControl->lruQueueTail);
+	local_buf_state1 = LockBufHdr(buf1);
+	buf1->nextInLRU = buf->buf_id;
+	UnlockBufHdr(buf1, local_buf_state1);
+	StrategyControl->lruQueueTail = buf->buf_id;
+		}
+	}
+	/*
+	 * If tail is empty then add it to add to LRU Queue and set it as tail. 
+	*/
+	else{
+		StrategyControl->lruQueueTail = buf->buf_id;
+		if(StrategyControl->lruQueueHead<0){
+			StrategyControl->lruQueueHead = buf->buf_id;
+		}
+	}
+	UnlockBufHdr(buf, local_buf_state);
+	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+	}
+}
+
 /*
  * StrategyGetBuffer
  *
@@ -193,14 +359,12 @@ have_free_buffer(void)
  *	return the buffer with the buffer header spinlock still held.
  */
 BufferDesc *
-StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_ring)
+StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
 	int			trycounter;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
-
-	*from_ring = false;
 
 	/*
 	 * If given a strategy object, see whether it can select a buffer. We
@@ -210,10 +374,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	{
 		buf = GetBufferFromRing(strategy, buf_state);
 		if (buf != NULL)
-		{
-			*from_ring = true;
 			return buf;
-		}
 	}
 
 	/*
@@ -302,58 +463,96 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
 			{
-				if (strategy != NULL)
+				if (strategy != NULL){
 					AddBufferToRing(strategy, buf);
+				}
 				*buf_state = local_buf_state;
+				elog(LOG, "Get buf from FreeList %d", buf->buf_id);
 				return buf;
 			}
 			UnlockBufHdr(buf, local_buf_state);
 		}
 	}
 
-	/* Nothing on the freelist, so run the "clock sweep" algorithm */
-	trycounter = NBuffers;
-	for (;;)
-	{
-		buf = GetBufferDescriptor(ClockSweepTick());
-
-		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
-		 */
-		local_buf_state = LockBufHdr(buf);
-
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
-		{
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
-			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
-
-				trycounter = NBuffers;
+	/**
+	 * Added By Kodanda Ravi Kiran Putta.
+	 * Nothing found in the freelist. Hence fetching the buffer from the head of LRU Queue if available.
+	 * If the head is END_OF_LRU then no it means no unpinned buffers are available as buffers with 
+	 * zero refcount will either be in freelist or lruQueue.
+	 * 
+	*/
+			SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+			if(StrategyControl->lruQueueHead==-3){
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				elog(ERROR, "no unpinned buffers available");
 			}
-			else
-			{
-				/* Found a usable buffer */
-				if (strategy != NULL)
+			  else{
+				buf = GetBufferDescriptor(StrategyControl->lruQueueHead);
+				/**
+				 * Make sure the buffer is in LRU Queue.
+				*/
+				Assert(buf->nextInLRU!=LRUNEXT_NOT_IN_LRU);
+				local_buf_state = LockBufHdr(buf);
+				/*
+				Remove buffer from the LRU queue when the 
+				buffer is selected for replacement.
+				*/
+				RemoveFromLRU_Locked(buf);
+				if(strategy!=NULL){
 					AddBufferToRing(strategy, buf);
+				}
 				*buf_state = local_buf_state;
+				// elog(LOG, "Get buf From LRU Queue %d", buf->buf_id);
 				return buf;
 			}
-		}
-		else if (--trycounter == 0)
-		{
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
-		}
-		UnlockBufHdr(buf, local_buf_state);
-	}
+			
+
+	// /* Nothing on the freelist, so run the "clock sweep" algorithm */
+	// trycounter = NBuffers;
+	// for (;;)
+	// {
+	// 	buf = GetBufferDescriptor(ClockSweepTick());
+
+	// 	/*
+	// 	 * If the buffer is pinned or has a nonzero usage_count, we cannot use
+	// 	 * it; decrement the usage_count (unless pinned) and keep scanning.
+	// 	 */
+	// 	local_buf_state = LockBufHdr(buf);
+
+	// 	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+	// 	{
+	// 		if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+	// 		{
+	// 			local_buf_state -= BUF_USAGECOUNT_ONE;
+
+	// 			trycounter = NBuffers;
+	// 		}
+	// 		else
+	// 		{
+	// 			/* Found a usable buffer */
+	// 			if (strategy != NULL){
+ 	// 				elog(LOG, "Get buf %d\n", buf->buf_id);
+	// 				AddBufferToRing(strategy, buf);
+	// 			}
+	// 			*buf_state = local_buf_state;
+	// 			elog(LOG, "Get buf %d\n", buf->buf_id);
+	// 			return buf;
+	// 		}
+	// 	}
+	// 	else if (--trycounter == 0)
+	// 	{
+	// 		/*
+	// 		 * We've scanned all the buffers without making any state changes,
+	// 		 * so all the buffers are pinned (or were when we looked at them).
+	// 		 * We could hope that someone will free one eventually, but it's
+	// 		 * probably better to fail than to risk getting stuck in an
+	// 		 * infinite loop.
+	// 		 */
+	// 		UnlockBufHdr(buf, local_buf_state);
+	// 		elog(ERROR, "no unpinned buffers available");
+	// 	}
+	// 	UnlockBufHdr(buf, local_buf_state);
+	// }
 }
 
 /*
@@ -370,6 +569,8 @@ StrategyFreeBuffer(BufferDesc *buf)
 	 */
 	if (buf->freeNext == FREENEXT_NOT_IN_LIST)
 	{
+		elog(LOG, "Add buf to FreeList %d\n", buf->buf_id);
+
 		buf->freeNext = StrategyControl->firstFreeBuffer;
 		if (buf->freeNext < 0)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
@@ -511,6 +712,9 @@ StrategyInitialize(bool init)
 		StrategyControl->firstFreeBuffer = 0;
 		StrategyControl->lastFreeBuffer = NBuffers - 1;
 
+		StrategyControl->lruQueueHead = LRUNEXT_END_IN_LRU;
+		StrategyControl->lruQueueTail = LRUNEXT_END_IN_LRU;
+
 		/* Initialize the clock sweep pointer */
 		pg_atomic_init_u32(&StrategyControl->nextVictimBuffer, 0);
 
@@ -540,7 +744,8 @@ StrategyInitialize(bool init)
 BufferAccessStrategy
 GetAccessStrategy(BufferAccessStrategyType btype)
 {
-	int			ring_size_kb;
+	BufferAccessStrategy strategy;
+	int			ring_size;
 
 	/*
 	 * Select ring size to use.  See buffer/README for rationales.
@@ -555,13 +760,13 @@ GetAccessStrategy(BufferAccessStrategyType btype)
 			return NULL;
 
 		case BAS_BULKREAD:
-			ring_size_kb = 256;
+			ring_size = 256 * 1024 / BLCKSZ;
 			break;
 		case BAS_BULKWRITE:
-			ring_size_kb = 16 * 1024;
+			ring_size = 16 * 1024 * 1024 / BLCKSZ;
 			break;
 		case BAS_VACUUM:
-			ring_size_kb = 256;
+			ring_size = 256 * 1024 / BLCKSZ;
 			break;
 
 		default:
@@ -570,63 +775,19 @@ GetAccessStrategy(BufferAccessStrategyType btype)
 			return NULL;		/* keep compiler quiet */
 	}
 
-	return GetAccessStrategyWithSize(btype, ring_size_kb);
-}
-
-/*
- * GetAccessStrategyWithSize -- create a BufferAccessStrategy object with a
- *		number of buffers equivalent to the passed in size.
- *
- * If the given ring size is 0, no BufferAccessStrategy will be created and
- * the function will return NULL.  ring_size_kb must not be negative.
- */
-BufferAccessStrategy
-GetAccessStrategyWithSize(BufferAccessStrategyType btype, int ring_size_kb)
-{
-	int			ring_buffers;
-	BufferAccessStrategy strategy;
-
-	Assert(ring_size_kb >= 0);
-
-	/* Figure out how many buffers ring_size_kb is */
-	ring_buffers = ring_size_kb / (BLCKSZ / 1024);
-
-	/* 0 means unlimited, so no BufferAccessStrategy required */
-	if (ring_buffers == 0)
-		return NULL;
-
-	/* Cap to 1/8th of shared_buffers */
-	ring_buffers = Min(NBuffers / 8, ring_buffers);
-
-	/* NBuffers should never be less than 16, so this shouldn't happen */
-	Assert(ring_buffers > 0);
+	/* Make sure ring isn't an undue fraction of shared buffers */
+	ring_size = Min(NBuffers / 8, ring_size);
 
 	/* Allocate the object and initialize all elements to zeroes */
 	strategy = (BufferAccessStrategy)
 		palloc0(offsetof(BufferAccessStrategyData, buffers) +
-				ring_buffers * sizeof(Buffer));
+				ring_size * sizeof(Buffer));
 
 	/* Set fields that don't start out zero */
 	strategy->btype = btype;
-	strategy->nbuffers = ring_buffers;
+	strategy->ring_size = ring_size;
 
 	return strategy;
-}
-
-/*
- * GetAccessStrategyBufferCount -- an accessor for the number of buffers in
- *		the ring
- *
- * Returns 0 on NULL input to match behavior of GetAccessStrategyWithSize()
- * returning NULL with 0 size.
- */
-int
-GetAccessStrategyBufferCount(BufferAccessStrategy strategy)
-{
-	if (strategy == NULL)
-		return 0;
-
-	return strategy->nbuffers;
 }
 
 /*
@@ -645,7 +806,7 @@ FreeAccessStrategy(BufferAccessStrategy strategy)
 
 /*
  * GetBufferFromRing -- returns a buffer from the ring, or NULL if the
- *		ring is empty / not usable.
+ *		ring is empty.
  *
  * The bufhdr spin lock is held on the returned buffer.
  */
@@ -658,7 +819,7 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 
 
 	/* Advance to next ring slot */
-	if (++strategy->current >= strategy->nbuffers)
+	if (++strategy->current >= strategy->ring_size)
 		strategy->current = 0;
 
 	/*
@@ -668,7 +829,10 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 	 */
 	bufnum = strategy->buffers[strategy->current];
 	if (bufnum == InvalidBuffer)
+	{
+		strategy->current_was_in_ring = false;
 		return NULL;
+	}
 
 	/*
 	 * If the buffer is pinned we cannot use it under any circumstances.
@@ -684,6 +848,7 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 		&& BUF_STATE_GET_USAGECOUNT(local_buf_state) <= 1)
 	{
+		strategy->current_was_in_ring = true;
 		*buf_state = local_buf_state;
 		return buf;
 	}
@@ -693,6 +858,7 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 	 * Tell caller to allocate a new buffer with the normal allocation
 	 * strategy.  He'll then replace this ring element via AddBufferToRing.
 	 */
+	strategy->current_was_in_ring = false;
 	return NULL;
 }
 
@@ -709,39 +875,6 @@ AddBufferToRing(BufferAccessStrategy strategy, BufferDesc *buf)
 }
 
 /*
- * Utility function returning the IOContext of a given BufferAccessStrategy's
- * strategy ring.
- */
-IOContext
-IOContextForStrategy(BufferAccessStrategy strategy)
-{
-	if (!strategy)
-		return IOCONTEXT_NORMAL;
-
-	switch (strategy->btype)
-	{
-		case BAS_NORMAL:
-
-			/*
-			 * Currently, GetAccessStrategy() returns NULL for
-			 * BufferAccessStrategyType BAS_NORMAL, so this case is
-			 * unreachable.
-			 */
-			pg_unreachable();
-			return IOCONTEXT_NORMAL;
-		case BAS_BULKREAD:
-			return IOCONTEXT_BULKREAD;
-		case BAS_BULKWRITE:
-			return IOCONTEXT_BULKWRITE;
-		case BAS_VACUUM:
-			return IOCONTEXT_VACUUM;
-	}
-
-	elog(ERROR, "unrecognized BufferAccessStrategyType: %d", strategy->btype);
-	pg_unreachable();
-}
-
-/*
  * StrategyRejectBuffer -- consider rejecting a dirty buffer
  *
  * When a nondefault strategy is used, the buffer manager calls this function
@@ -753,14 +886,14 @@ IOContextForStrategy(BufferAccessStrategy strategy)
  * if this buffer should be written and re-used.
  */
 bool
-StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc *buf, bool from_ring)
+StrategyRejectBuffer(BufferAccessStrategy strategy, BufferDesc *buf)
 {
 	/* We only do this in bulkread mode */
 	if (strategy->btype != BAS_BULKREAD)
 		return false;
 
 	/* Don't muck with behavior of normal buffer-replacement strategy */
-	if (!from_ring ||
+	if (!strategy->current_was_in_ring ||
 		strategy->buffers[strategy->current] != BufferDescriptorGetBuffer(buf))
 		return false;
 

@@ -3,7 +3,7 @@
  * buf_init.c
  *	  buffer manager initialization routines
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -78,12 +78,9 @@ InitBufferPool(void)
 						NBuffers * sizeof(BufferDescPadded),
 						&foundDescs);
 
-	/* Align buffer pool on IO page size boundary. */
 	BufferBlocks = (char *)
-		TYPEALIGN(PG_IO_ALIGN_SIZE,
-				  ShmemInitStruct("Buffer Blocks",
-								  NBuffers * (Size) BLCKSZ + PG_IO_ALIGN_SIZE,
-								  &foundBufs));
+		ShmemInitStruct("Buffer Blocks",
+						NBuffers * (Size) BLCKSZ, &foundBufs);
 
 	/* Align condition variables to cacheline boundary. */
 	BufferIOCVArray = (ConditionVariableMinimallyPadded *)
@@ -119,10 +116,10 @@ InitBufferPool(void)
 		{
 			BufferDesc *buf = GetBufferDescriptor(i);
 
-			ClearBufferTag(&buf->tag);
+			CLEAR_BUFFERTAG(buf->tag);
 
 			pg_atomic_init_u32(&buf->state, 0);
-			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
+			buf->wait_backend_pgprocno = INVALID_PGPROCNO;
 
 			buf->buf_id = i;
 
@@ -131,6 +128,13 @@ InitBufferPool(void)
 			 * management of this list is done by freelist.c.
 			 */
 			buf->freeNext = i + 1;
+
+			/*
+			Initially no buffers will be in LRU queue. Modified by Kodanda Ravi Kiran Putta
+			*/
+
+			buf->nextInLRU = LRUNEXT_NOT_IN_LRU;
+			buf->prevInLRU = LRUNEXT_NOT_IN_LRU;
 
 			LWLockInitialize(BufferDescriptorGetContentLock(buf),
 							 LWTRANCHE_BUFFER_CONTENT);
@@ -166,8 +170,7 @@ BufferShmemSize(void)
 	/* to allow aligning buffer descriptors */
 	size = add_size(size, PG_CACHE_LINE_SIZE);
 
-	/* size of data pages, plus alignment padding */
-	size = add_size(size, PG_IO_ALIGN_SIZE);
+	/* size of data pages */
 	size = add_size(size, mul_size(NBuffers, BLCKSZ));
 
 	/* size of stuff controlled by freelist.c */
